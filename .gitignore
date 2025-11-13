@@ -1,0 +1,89 @@
+# ==== RoadDetailBuilder Git Ignore =====================================
+# Rhino / Grasshopper generated & temporary artifacts + Python cache
+# --------------------------------------------------------------------
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Build / distribution (if later packaged)
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE/editor settings (optional - keep if you want to share)
+.vscode/
+.idea/
+*.swp
+
+# OS clutter
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs & profiles
+*.log
+profile.json
+
+# Rhino specific temporary / autosave / backup files
+# Rhino autosave often uses .3dmbak; include both .3dm backups and autosave patterns
+*.3dmbak
+*.3dm.bak
+*.rhl
+*.ril
+*.rhp
+*.rhp.bak
+*.rvb
+*.rvb.bak
+*.rui.bak
+
+# Rhino crash / dump / lock files
+*.dmp
+*.crash
+*.lock
+
+# Grasshopper temp / user data / autosave
+*.ghx
+*.ghuser
+*.ghbak
+*.gh.autosave
+*.ghx.autosave
+*.ghcanvas.xml
+# Grasshopper caches sometimes appear under AppData; ignore local export folder if added
+appdata/
+
+# McNeel plugin compiled caches (if any local dumps)
+*.cache
+
+# Misc backup suffixes
+*.bak
+*.old
+*.tmp
+~$*
+
+# Images/renders (export artifacts you don't want in VCS)
+render_output/
+*.png
+*.jpg
+*.tif
+*.exr
+
+# Exported analysis CSV/JSON
+exports/
+*.csv
+*.json
+
+# Jupyter (if ever used transiently)
+.ipynb_checkpoints/
+*.ipynb
+
+# =====================================================================
+# End of .gitignore
