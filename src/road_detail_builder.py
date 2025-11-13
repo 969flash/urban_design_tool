@@ -265,6 +265,7 @@ def get_source_centerlines(doc: Rhino.RhinoDoc) -> List[Tuple[geo.Curve, float]]
                                 poly_crv = None
 
                             if poly_crv and getattr(poly_crv, "IsValid", True):
+                                print("SUCCEEDED POLY CONVERT")
                                 results.append((poly_crv, total_width))
                                 valid_found = True
                                 added_count += 1
@@ -273,6 +274,7 @@ def get_source_centerlines(doc: Rhino.RhinoDoc) -> List[Tuple[geo.Curve, float]]
                             # 폴리라인 변환이 실패하면 원본 커브의 복제본을 사용
                             try:
                                 results.append((geom.DuplicateCurve(), total_width))
+                                print("FAIL POLY CONVERT")
                                 valid_found = True
                                 added_count += 1
                             except Exception:
@@ -430,15 +432,25 @@ def create_band_surface(
 def _to_polyline_curve(
     curve: geo.Curve, segment_length: float, tol: float
 ) -> Optional[geo.Curve]:
-    """커브를 일정 길이 간격으로 샘플링하여 PolylineCurve로 근사합니다.
+    """커브를 PolylineCurve로 안정적으로 근사합니다.
 
-    segment_length: 각 분할 세그먼트의 길이(모델 단위).
-    tol: 문서 공차 (fallback 및 계산에 사용).
+    - 과도한 세그먼트 길이로 인해 형태가 뻥튀기(과대)되는 문제를 줄이기 위해
+      세그먼트 개수를 길이에 따라 적절히 제한/보정합니다.
+    - 닫힌 커브의 경우 시작/끝 포인트 중복으로 긴 세그먼트가 생기지 않도록 처리합니다.
+
+    Args:
+        curve (geo.Curve): 입력 커브.
+        segment_length (float): 목표 세그먼트 길이(상한/하한으로만 사용될 수 있음).
+        tol (float): 문서 공차(포인트 비교 등 기준).
+
+    Returns:
+        Optional[geo.PolylineCurve]: 근사된 폴리라인 커브. 실패 시 원본 복제 또는 None.
     """
     if curve is None:
         return None
+
     try:
-        # 이미 폴리라인 커브라면 복제 반환
+        # 이미 폴리라인이면 복제 반환
         if isinstance(curve, geo.PolylineCurve):
             return curve.DuplicateCurve()
 
@@ -446,20 +458,27 @@ def _to_polyline_curve(
         if not length or length <= 0.0:
             return curve.DuplicateCurve()
 
-        # 안전한 세그먼트 길이
-        seg_len = (
+        # 샘플 개수 계산: 길이에 비례, 과소/과대 샘플링 방지
+        # - segment_length가 크면 과도 단순화되어 offset 시 부풀어 보이는 문제 발생 가능
+        # - 최소/최대 세그먼트 개수 클램핑으로 안정화
+        base_seg_len = (
             float(segment_length)
-            if segment_length and segment_length > 0.0
-            else max(0.5, tol * 10.0)
+            if segment_length and segment_length > 0
+            else max(0.25, tol * 10.0)
         )
+        est_count = max(2, int(math.ceil(length / base_seg_len)))
+        count = max(32, min(est_count, 512))  # [32, 512]로 제한
 
-        # params: 시작점을 포함하는 파라미터 리스트
-        params = curve.DivideByLength(seg_len, True)
+        # 파라미터 샘플 (양 끝 포함)
+        params = curve.DivideByCount(count, True)
+        if not params or len(params) < 2:
+            # DivideByLength 폴백
+            params = curve.DivideByLength(base_seg_len, True)
+
         if not params:
-            # fallback: DivideByCount
-            count = max(2, int(math.ceil(length / seg_len)))
-            params = curve.DivideByCount(count, True)
+            return curve.DuplicateCurve()
 
+        # 포인트 생성
         pts = []
         for t in params:
             try:
@@ -467,27 +486,38 @@ def _to_polyline_curve(
             except Exception:
                 continue
 
-        # ensure start and end points included
-        try:
-            dom = curve.Domain
-            start_pt = curve.PointAt(dom.Min)
-            end_pt = curve.PointAt(dom.Max)
-            if not pts or (pts and pts[0].DistanceTo(start_pt) > tol * 1e-3):
-                pts.insert(0, start_pt)
-            if pts[-1].DistanceTo(end_pt) > tol * 1e-3:
-                pts.append(end_pt)
-        except Exception:
-            pass
-
         if len(pts) < 2:
             return curve.DuplicateCurve()
 
+        # 닫힌 커브 처리: 끝점을 시작점과 강제로 일치시켜 불필요한 장거리 세그먼트 방지
+        is_closed = False
+        try:
+            is_closed = bool(curve.IsClosed)
+        except Exception:
+            is_closed = False
+
+        if is_closed:
+            # 첫/끝 점이 충분히 가까우면 끝 점을 첫 점으로 스냅
+            if pts[0].DistanceTo(pts[-1]) <= max(tol, 1e-6):
+                pts[-1] = geo.Point3d(pts[0])
+
         pl = geo.Polyline(pts)
+
+        # 닫힌 상태 보정 (PolylineCurve에서 닫힘 성질 유지)
+        try:
+            if is_closed and not pl.IsClosed:
+                pl.Add(pl[0])
+        except Exception:
+            pass
+
         if pl.IsValid:
-            return geo.PolylineCurve(pl)
+            plc = geo.PolylineCurve(pl)
+            if getattr(plc, "IsValid", False):
+                return plc
     except Exception:
         pass
 
+    # 최종 폴백: 원본 복제
     try:
         return curve.DuplicateCurve()
     except Exception:
