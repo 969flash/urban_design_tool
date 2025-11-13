@@ -707,53 +707,71 @@ ess_create_edgelines_doc = (
 )
 
 
-def create_edgelines(
-    centerline_curve: geo.Curve, total_width: float, line_width: float
+def create_edgelines_from_regions(
+    road_regions: List[geo.Curve], line_width: float, inset: Optional[float] = None
 ) -> List[geo.Surface]:
-    """도로 가장자리(EdgeLine) Surface 2개를 생성합니다.
+    """도로 영역(road_regions) 경계로부터 안쪽으로 inset만큼 오프셋한 경로를 기준으로 EdgeLine 생성.
 
-    가장자리 오프셋: total_width/2 에서 line_width*2 만큼 안쪽으로 이동한 위치.
+    - 기존 방식(중심선 기준) 대신, 이미 생성된 도로 영역의 외곽 경계를 신뢰 소스로 사용합니다.
+    - 각 경계 커브를 내부로 inset만큼 오프셋한 커브를 중심 커브로 삼아 폭 line_width의 띠 Surface를 만듭니다.
 
     Args:
-        centerline_curve (geo.Curve): 기준 중심선 커브.
-        total_width (float): 도로 총 폭.
-        line_width (float): 선 폭.
+        road_regions (List[geo.Curve]): 도로 영역 경계 커브 리스트(닫힌 커브 권장).
+        line_width (float): EdgeLine의 폭.
+        inset (Optional[float]): 외곽에서 내부로 떨어질 거리. 기본값은 2*line_width.
 
     Returns:
-        List[geo.Surface]: 생성된 가장자리 선 Surface 리스트(좌/우 2개).
+        List[geo.Surface]: 생성된 EdgeLine Surface 리스트.
     """
     out: List[geo.Surface] = []
-    if not centerline_curve or total_width is None or line_width is None:
-        return out
-    if total_width <= 0.0 or line_width <= 0.0:
+    if not road_regions or line_width is None or line_width <= 0.0:
         return out
 
     tol = _get_model_tol(sc.doc if hasattr(sc, "doc") else None)
+    d_inset = float(inset) if inset is not None else 2.0 * float(line_width)
+    if d_inset <= 0.0:
+        d_inset = 2.0 * float(line_width)
 
     try:
-        edge_offset = 0.5 * float(total_width)
-        inset = 2.0 * float(line_width)
-        final_offset = edge_offset - inset
-        if final_offset <= 0.0:
-            debug_print(
-                "[edgeline] final_offset <= 0",
-                "edge_offset=",
-                edge_offset,
-                "inset=",
-                inset,
-            )
-            return out
-
-        left = _offset_curve(centerline_curve, +final_offset, tol)
-        right = _offset_curve(centerline_curve, -final_offset, tol)
-
-        for crv in (left, right):
-            if not crv:
+        for region in road_regions:
+            if not isinstance(region, geo.Curve):
                 continue
-            srf = create_line_surface(crv, line_width)
-            if srf:
-                out.append(srf)
-        debug_print("[edgeline] final_offset=", final_offset, "surfaces=", len(out))
+            if not getattr(region, "IsClosed", False):
+                # 폐곡선이 아니면 스킵
+                continue
+
+            # 내부로 inset + (line_width/2)를 이동한 '중심 경로'를 만들고, 그 경로 기준 폭 line_width로 띠를 생성
+            center_offset = d_inset + 0.5 * float(line_width)
+            try:
+                inner_paths = offset_regions_outward(
+                    region, center_offset
+                )  # from utils
+            except Exception:
+                inner_paths = None
+
+            if not inner_paths:
+                # 영역이 너무 좁아 오프셋 불가한 경우
+                continue
+
+            # 가장 긴 내부 경로를 대표로 선택
+            try:
+                inner_paths = [c for c in inner_paths if isinstance(c, geo.Curve)]
+                inner_paths.sort(
+                    key=lambda c: c.GetLength() if c.IsValid else 0.0, reverse=True
+                )
+            except Exception:
+                pass
+
+            for path in inner_paths:
+                try:
+                    if not path or not getattr(path, "IsValid", True):
+                        continue
+                    srf = create_line_surface(path, line_width)
+                    if srf:
+                        out.append(srf)
+                except Exception:
+                    continue
+        debug_print("[edgeline] from regions: inset=", d_inset, "surfaces=", len(out))
     except Exception:
         return out
 
@@ -800,6 +818,12 @@ def run_road_builder(
         all_lanelines: List[geo.Surface] = []
         all_edgelines: List[geo.Surface] = []
 
+        # 선택 입력: road_regions (GH에서 직접 입력되는 경우 우선 사용)
+        try:
+            rr_input = list(globals().get("road_regions", []))
+        except Exception:
+            rr_input = []
+
         debug_print(
             "[run] inputs:",
             {"lane_width": lane_width, "line_width": line_width, "Bake": Bake},
@@ -819,11 +843,30 @@ def run_road_builder(
                 ls = create_lanelines(
                     center_crv, total_width, lane_width, line_width, num_lanes
                 )
-                es = create_edgelines(center_crv, total_width, line_width)
+                # 에지라인: road_regions 입력이 없을 때만 기존 방식으로 생성 (중심선 기반)
+                if not rr_input:
+                    es_local: List[geo.Surface] = []
+                    try:
+                        tol_local = _get_model_tol(
+                            sc.doc if hasattr(sc, "doc") else None
+                        )
+                        edge_offset = 0.5 * float(total_width)
+                        inset_val = 2.0 * float(line_width)
+                        final_offset = edge_offset - inset_val
+                        if final_offset > 0.0:
+                            left = _offset_curve(center_crv, +final_offset, tol_local)
+                            right = _offset_curve(center_crv, -final_offset, tol_local)
+                            for crv in (left, right):
+                                if crv:
+                                    srf = create_line_surface(crv, line_width)
+                                    if srf:
+                                        es_local.append(srf)
+                    except Exception:
+                        es_local = []
+                    all_edgelines.extend(es_local)
 
                 all_centerlines.extend(cs)
                 all_lanelines.extend(ls)
-                all_edgelines.extend(es)
 
                 debug_print(
                     "[run] total_width=",
@@ -835,10 +878,19 @@ def run_road_builder(
                     "lane=",
                     len(ls),
                     "edge=",
-                    len(es),
+                    (len(es_local) if not rr_input else 0),
                 )
             except Exception:
                 continue
+
+        # road_regions 입력이 있는 경우: 영역 기반으로 edgelines 생성 (기존 방식 대체)
+        if rr_input:
+            try:
+                all_edgelines = create_edgelines_from_regions(
+                    rr_input, line_width, inset=2.0 * float(line_width)
+                )
+            except Exception:
+                pass
 
         if Bake and sc.doc is not None:
             try:

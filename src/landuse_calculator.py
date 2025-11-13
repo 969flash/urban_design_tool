@@ -1,6 +1,5 @@
 import Rhino
 import Rhino.Geometry as rg
-import utils
 import ghpythonlib.components as ghcomp
 import scriptcontext as sc
 import os
@@ -25,6 +24,81 @@ if sys.version_info[0] >= 3:
     basestring = str
 
 
+def extrude_srf(srf, height):
+    """Surface or Brep를 z축 방향으로 height만큼 Extrude한 Brep 반환"""
+    extrusion = ghcomp.Extrude(srf, rg.Vector3d(0, 0, height))
+    return ghcomp.CapHoles(extrusion)
+
+
+def get_layer_surfaces(doc, parent_name):
+    """
+    Landuse 하위 레이어별 Surface/Brep 수집 → dict로 반환
+    ex: {'Commercial': [Brep1, Brep2], 'Residential': [Brep3, ...]}
+    """
+    layer_dict = {}
+    for layer in doc.Layers:
+        if not layer.IsVisible:
+            continue
+
+        # 부모-자식 레이어 관계 확인 (FullPath 기준)
+        full_path = getattr(layer, "FullPath", layer.Name)
+        parts = full_path.split("::") if full_path else []
+        if len(parts) >= 2 and parts[0] == parent_name:
+            # 직계 하위명 (Parent::Child[::Grand...])에서 Child 추출
+            child_name = parts[1]
+
+            objs = [
+                obj
+                for obj in doc.Objects.FindByLayer(layer)
+                if isinstance(obj.Geometry, rg.Surface)
+                or isinstance(obj.Geometry, rg.Brep)
+            ]
+
+            srfs = []
+            for obj in objs:
+                geo = obj.Geometry
+                if isinstance(geo, rg.Surface):
+                    srfs.append(rg.Brep.CreateFromSurface(geo))
+                elif isinstance(geo, rg.Brep):
+                    srfs.append(geo)
+
+            # 동일 Child 이름으로 누적 (손자 레이어까지 포함 시 합쳐짐)
+            if child_name in layer_dict:
+                layer_dict[child_name].extend(srfs)
+            else:
+                layer_dict[child_name] = srfs
+
+    return layer_dict
+
+
+def is_point_on_srf(pt, srf):
+    pt_on_srf = ghcomp.SurfaceClosestPoint(pt, srf).point
+    return pt_on_srf.DistanceTo(pt) < 0.01
+
+
+def get_point_inside_face(surface):
+
+    # Brep에서 메시 생성 (기본 세분화 파라미터 사용)
+    meshes = rg.Mesh.CreateFromBrep(surface, rg.MeshingParameters.Default)
+
+    # 메시 리스트 중 첫 번째 메시 반환 (대부분 하나의 메시 생성됨)
+    if meshes and len(meshes) > 0:
+        mesh = meshes[0]
+    # 첫 번째 삼각형(face) 인덱스의 세 점을 가져옴
+    indices = mesh.Faces[0]
+
+    p0 = mesh.Vertices[indices.A]
+    p1 = mesh.Vertices[indices.B]
+    p2 = mesh.Vertices[indices.C]
+
+    # 삼각형 무게중심 계산
+    return rg.Point3d(
+        (p0.X + p1.X + p2.X) / 3.0,
+        (p0.Y + p1.Y + p2.Y) / 3.0,
+        (p0.Z + p1.Z + p2.Z) / 3.0,
+    )
+
+
 def calc_landuse_areas_with_roads(
     doc,
     road_regions,
@@ -47,7 +121,7 @@ def calc_landuse_areas_with_roads(
         decons = []
         for lu_srf in lu_srfs:
             # Landuse Extrude
-            base_brep = utils.extrude_srf(lu_srf, z_h)
+            base_brep = extrude_srf(lu_srf, z_h)
             diff_brep = base_brep
 
             # 도로영역 차감
@@ -74,7 +148,7 @@ def calc_landuse_areas_with_roads(
                 if mp and mp.Centroid.Z > z_lim:
                     continue
 
-                if not utils.is_point_on_srf(utils.get_point_inside_face(f), lu_srf):
+                if not is_point_on_srf(get_point_inside_face(f), lu_srf):
                     continue
 
                 total += mp.Area
@@ -93,12 +167,12 @@ def calc_landuse_areas_with_roads(
     results = {}
 
     # Landuse dict: {용도명: [Brep, ...]}
-    landuse_dict = utils.get_layer_surfaces(doc, landuse_parent)
+    landuse_dict = get_layer_surfaces(doc, landuse_parent)
 
     # 도로 영역 Extrude
     road_breps = []
     for r in road_regions:
-        road_brep = utils.extrude_srf(r, z_height)
+        road_brep = extrude_srf(r, z_height)
         if road_brep:
             road_breps.append(road_brep)
 
@@ -565,6 +639,66 @@ if _faces_for_bake is not None:
 # -------------------------------------------------
 # 선택 기능: BakeRoadSubRegion = True일 때, 'Landuse-Road' 트리에 결과 베이크
 # -------------------------------------------------
+def _find_layer_by_fullpath(doc, fullpath):
+    for ly in doc.Layers:
+        fp = getattr(ly, "FullPath", None) or ly.Name or ""
+        if fp == fullpath:
+            return ly
+    return None
+
+
+def _ensure_layer(doc, name, parent_id=None):
+    # 동일 이름 + 동일 부모인 레이어 찾기
+    if parent_id:
+        parent = doc.Layers.FindId(parent_id)
+        parent_path = getattr(parent, "FullPath", parent.Name) if parent else None
+        target_path = (parent_path + "::" + name) if parent_path else name
+        found = _find_layer_by_fullpath(doc, target_path)
+        if found:
+            return found
+    else:
+        # 최상위에서 이름 일치하는 첫 레이어 반환
+        for ly in doc.Layers:
+            if ly.ParentLayerId == System.Guid.Empty:
+                if ly.Name == name:
+                    return ly
+
+    layer = Rhino.DocObjects.Layer()
+    layer.Name = name
+    if parent_id:
+        layer.ParentLayerId = parent_id
+        # 부모 레이어 색상 복제 (시각적 일관성)
+        try:
+            parent_layer = doc.Layers.FindId(parent_id)
+            if parent_layer:
+                layer.Color = parent_layer.Color
+        except Exception:
+            pass
+    idx = doc.Layers.Add(layer)
+    return doc.Layers[idx] if idx >= 0 else None
+
+
+def _clear_layer_tree(doc, parent_name):
+    # parent_name 하위 모든 레이어의 객체 삭제
+    parent = None
+    for ly in doc.Layers:
+        if ly.Name == parent_name and (ly.ParentLayerId == System.Guid.Empty):
+            parent = ly
+            break
+    if not parent:
+        return 0
+    parent_path = getattr(parent, "FullPath", None) or parent.Name or ""
+    deleted = 0
+    for ly in doc.Layers:
+        fp = getattr(ly, "FullPath", None) or ly.Name or ""
+        if parent_path and (fp == parent_path or fp.startswith(parent_path + "::")):
+            objs = doc.Objects.FindByLayer(ly) or []
+            for obj in objs:
+                if doc.Objects.Delete(obj, True):
+                    deleted += 1
+    return deleted
+
+
 def _duplicate_face_to_brep(face):
     try:
         return face.DuplicateFace(True)
@@ -574,6 +708,36 @@ def _duplicate_face_to_brep(face):
             return rg.Brep.CreateFromSurface(srf)
         except Exception:
             return None
+
+
+def _planar_breps_from_face(doc, face):
+    """Return robust planar Breps from a BrepFace using duplicate or planar rebuild from loops."""
+    breps = []
+    fb = None
+    try:
+        fb = face.DuplicateFace(True)
+        if fb and fb.IsValid:
+            breps.append(fb)
+    except Exception:
+        fb = None
+    if not breps:
+        try:
+            tol = doc.ModelAbsoluteTolerance if doc else 0.01
+            crvs = []
+            for loop in face.Loops:
+                try:
+                    crv = loop.To3dCurve()
+                    if crv and crv.IsClosed:
+                        crvs.append(crv)
+                except Exception:
+                    pass
+            if crvs:
+                made = rg.Brep.CreatePlanarBreps(crvs, tol)
+                if made:
+                    breps.extend([b for b in made if b and b.IsValid])
+        except Exception:
+            pass
+    return breps
 
 
 def compute_landuse_road_cut_faces_from_cache(doc, cached_face_dict, z_limit=0.1):
@@ -591,7 +755,7 @@ def compute_landuse_road_cut_faces_from_cache(doc, cached_face_dict, z_limit=0.1
                     continue
             except Exception:
                 pass
-            fbreps = utils.planar_breps_from_face(doc, f)
+            fbreps = _planar_breps_from_face(doc, f)
             if fbreps:
                 breps.extend(fbreps)
         result[lu_name] = breps
@@ -613,13 +777,13 @@ def bake_road_subregion_results(
     """
     baked = 0
     # 레이어 준비
-    parent_layer = utils.ensure_layer(doc, target_parent, parent_id=None)
+    parent_layer = _ensure_layer(doc, target_parent, parent_id=None)
     if not parent_layer:
         raise Exception("레이어 생성 실패: {}".format(target_parent))
 
     # 기존 결과 제거 (선택)
     if clear_existing:
-        utils.clear_layer_tree(doc, target_parent)
+        _clear_layer_tree(doc, target_parent)
 
     # 결과 계산
     # 캐시 사용: 면적 계산 단계에서 이미 추출한 Face 활용 (중복 연산 제거)
@@ -628,7 +792,7 @@ def bake_road_subregion_results(
         if _faces_for_bake is not None
         else {}
     )
-    print("faces_by_lu:", faces_by_lu)
+
     # 캐시가 비어있을 때의 안전장치: 필요 시 즉석 재계산으로 보정
     if (not faces_by_lu) and BAKE_ROAD_SUBREGION:
         try:
@@ -660,10 +824,10 @@ def bake_road_subregion_results(
             dprint("[Bake] {} -> {} breps".format(lu_name, len(faces)))
         except Exception:
             pass
-        child_layer = utils.ensure_layer(doc, lu_name, parent_id=parent_layer.Id)
+        child_layer = _ensure_layer(doc, lu_name, parent_id=parent_layer.Id)
         # 기존 Landuse 동일 이름 레이어 색상 가져오기
         try:
-            original = utils.find_layer_by_fullpath(doc, "Landuse::" + lu_name)
+            original = _find_layer_by_fullpath(doc, "Landuse::" + lu_name)
             if original:
                 lyr = doc.Layers[child_layer.Index]
                 lyr.Color = original.Color
