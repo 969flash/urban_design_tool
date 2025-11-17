@@ -9,6 +9,15 @@ import System
 from System import Activator, Type
 from System.Runtime.InteropServices import Marshal
 
+
+class Block:
+    def __init__(self, region, landuse_name, block_id):
+        self.region = region
+        self.landuse_name = landuse_name
+        self.block_id = block_id
+        self.buildings = []  # 2D 건물라인 리스트
+
+
 try:
     # optional: openpyxl fallback for saving without Excel COM or without a template
     from openpyxl import Workbook
@@ -884,6 +893,54 @@ try:
     )
 except Exception as _bake_err:
     dprint("BakeRoadSubRegion 오류:", _bake_err)
+
+# --------------------------------------------
+# GH Output: blocks (도로로 잘려나간 용도 블록 객체 리스트)
+# - 우선 면적 계산 시 수집된 Face 캐시를 이용해 평면 Brep로 변환
+# - 캐시가 없으면 안전하게 한 번 재계산하여 확보
+# - 각 Brep를 Block(region, landuse_name, block_id) 객체로 포장하여 반환
+# --------------------------------------------
+blocks = []
+try:
+    _by_lu = (
+        compute_landuse_road_cut_faces_from_cache(doc, _faces_for_bake, z_limit=0.1)
+        if _faces_for_bake is not None
+        else {}
+    )
+    if not _by_lu:
+        _tmp_cache2 = {}
+        calc_landuse_areas_with_roads(
+            doc,
+            road_regions,
+            landuse_parent="Landuse",
+            z_height=1.0,
+            z_limit=0.1,
+            faces_collector=_tmp_cache2,
+        )
+        _by_lu = compute_landuse_road_cut_faces_from_cache(
+            doc, _tmp_cache2, z_limit=0.1
+        )
+
+    # Block 객체로 감싸서 평탄화하여 단일 리스트로 출력
+    if _by_lu:
+        per_lu_counts = {}
+        for _lu, _lst in _by_lu.items():
+            if not _lst:
+                continue
+            idx = per_lu_counts.get(_lu, 0)
+            for _brep in _lst:
+                idx += 1
+                try:
+                    bid = f"{_lu}_{idx}"
+                    blocks.append(Block(region=_brep, landuse_name=_lu, block_id=bid))
+                except Exception:
+                    # 실패 시 스킵
+                    pass
+            per_lu_counts[_lu] = idx
+    dprint("blocks count:", len(blocks))
+except Exception as _blocks_err:
+    dprint("blocks compute error:", _blocks_err)
+    blocks = []
 
 # 사이트 총면적 (SiteBoundary 최대 폐곡선)
 site_curve, site_area = get_site_boundary_area(doc, site_layer)
