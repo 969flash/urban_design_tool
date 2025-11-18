@@ -212,17 +212,6 @@ DEFAULT_COL_LANDUSE = 4
 DEFAULT_COL_AREA = 5
 DEFAULT_COL_PERC = 6
 
-# 대분류 매핑 (템플릿 예시 기준) - 필요 시 수정 가능
-CATEGORY_MAP = {
-    "Campus/R&D": ["Campus", "R&D"],
-    "Living": ["Residential", "Dormitory", "Commercial", "School"],
-    "Green/Open space": ["Green", "Park"],
-    "Road/Infra": ["Transport", "Energy/Infra", "Rail", "Road"],
-    "Reserve": ["Reserve"],
-    # 기타가 매핑되지 않은 용도들의 바스켓
-    "Etc": [],
-}
-
 
 def get_site_boundary_area(doc, layer_name="SiteBoundary"):
     """SiteBoundary 레이어의 폐곡선 평면 커브 중 최대 면적을 사이트 총면적으로 사용."""
@@ -552,26 +541,9 @@ def build_report_text(landuse_areas):
     if not landuse_areas:
         return "No areas computed."
 
-    # 1) Etc 처리: 알려진 카테고리 외 항목은 Etc로 합산
-    known = set()
-    for k, v in CATEGORY_MAP.items():
-        if k == "Etc":
-            continue
-        known.update(v)
-
-    merged = {}
-    etc_total = 0.0
-    for name, val in landuse_areas.items():
-        if name in known or name.lower() in ("etc", "기타"):
-            merged[name] = merged.get(name, 0.0) + float(val)
-        else:
-            etc_total += float(val)
-    if etc_total > 0.0:
-        merged["Etc"] = merged.get("Etc", 0.0) + etc_total
-
-    # 2) 정렬 및 합계
-    total = sum(merged.values())
-    rows = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+    # 그대로 레이어(용도) 이름을 사용해 정렬 및 합계
+    rows = sorted(landuse_areas.items(), key=lambda kv: kv[1], reverse=True)
+    total = sum(val for _, val in rows)
 
     # 3) 서식화 (샘플 스타일)
     title = "--- Area Report ({}) ---".format(datetime.now().date())
