@@ -331,9 +331,6 @@ except Exception as bake_err:
 
 blocks = build_blocks(planar_cache)
 
-a = None  # legacy GH output placeholder (area data removed)
-b = None  # legacy GH output placeholder (file path removed)
-report = "Area report 기능이 비활성화되었습니다."
 out_lines = [
     "Landuse trimming complete.",
     "Landuse categories: {}".format(len(planar_cache)),
